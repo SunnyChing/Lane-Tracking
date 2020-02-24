@@ -1662,6 +1662,7 @@ void mcvGetLanes(const CvMat *inImage, const CvMat *clrImage,
 
   //int numStrips = 2;
   int stripHeight = ipm->height / stopLineConf->numStrips;
+  vector<Spline> bestSplines;
   for (int i = 0; i < stopLineConf->numStrips; i++) //lines
   {
     //get the mask
@@ -1710,7 +1711,7 @@ void mcvGetLanes(const CvMat *inImage, const CvMat *clrImage,
 
     //get the lines/splines
     mcvGetLines(subimage, LINE_VERTICAL, subimageLines, subimageLineScores,
-                subimageSplines, subimageSplineScores, stopLineConf,
+                subimageSplines, bestSplines,subimageSplineScores, stopLineConf,
                 state,ipmInfo);
 
     //put back
@@ -1760,7 +1761,7 @@ void mcvGetLanes(const CvMat *inImage, const CvMat *clrImage,
   mcvPostprocessLines_(image, clrImage, fipm, ipm, *lines, *lineScores,
                       *splines, *splineScores,
                       stopLineConf, state, *ipmInfo, *cameraInfo); //rawipm
-
+  state->bestSplines = bestSplines;
   // Sunny - for return the ipm image
   cvCopy(dbIpmImage, dbipm); //ipm
                              // Sunny - comment DEBUG_LINES
@@ -1787,7 +1788,7 @@ void mcvGetLanes(const CvMat *inImage, const CvMat *clrImage,
       mcvDrawSpline(dbIpmImage, dbIpmSplines[i], CV_RGB(0, 255,0), 1);
       //cin.get();
     }
-  SHOW_IMAGE(dbIpmImage, "Lanes IPM with lines", 10);
+  //SHOW_IMAGE(dbIpmImage, "Lanes IPM with lines", 1);
   //cin.get();
   if(0)
   {
@@ -1881,6 +1882,8 @@ void mcvPostprocessLines_(const CvMat *image, const CvMat *clrImage,
         Spline spline = mcvFitBezierSpline(p, lineConf->ransacSplineDegree);
         //Sunny
         spline.label = splines[i].label;
+        spline.tangent = splines[i].tangent;
+        spline.line = splines[i].line;
 
         //save
 #warning "Check this later: extension in IPM. Check threshold value"
@@ -2218,7 +2221,7 @@ void mcvPostprocessLines(const CvMat *image, const CvMat *clrImage,
  */
 void mcvGetLines(const CvMat *image, LineType lineType,
                  vector<Line> &lines, vector<float> &lineScores,
-                 vector<Spline> &splines, vector<float> &splineScores,
+                 vector<Spline> &splines,vector<Spline> &bestsplines, vector<float> &splineScores,
                  LaneDetectorConf *lineConf, LineState *state, IPMInfo *ipmInfo)
 {
 
@@ -2274,7 +2277,6 @@ void mcvGetLines(const CvMat *image, LineType lineType,
       mcvGetRansacLines(image, lines, lineScores, lineConf, lineType,state);
     
     //do RANSAC splines?
-
     if (lineConf->ransacSpline) // get splines, merge splines
       mcvGetRansacSplines(image, lines, lineScores,
                           lineConf, lineType, splines, splineScores, bestSplines,bestSplineScores,state,ipmInfo);
@@ -3436,6 +3438,287 @@ void mcvFitRobustLine(const CvMat *points, float *lineRTheta,
  * \param lineScore the score of the line detected
  *
  */
+/*Sunny*/ // consider slope
+void mcvFitRansacLine_slope(const CvMat *image, int numSamples, int numIterations,
+                      float threshold, float scoreThreshold, int numGoodFit,
+                      bool getEndPoints, LineType lineType,
+                      Line *lineXY, float *lineRTheta, float *lineScore, LineState *state)
+{
+
+  //get the points with non-zero pixels
+  CvMat *points;
+  points = mcvGetNonZeroPoints(image, true);
+  if (!points)
+    return;
+  //check numSamples
+  if (numSamples > points->cols)
+    numSamples = points->cols;
+  //subtract half
+  cvAddS(points, cvRealScalar(0.5), points);
+
+  //normalize pixels values to get weights of each non-zero point
+  //get third row of points containing the pixel values
+  CvMat w;
+  cvGetRow(points, &w, 2);
+  //normalize it
+  CvMat *weights = cvCloneMat(&w);
+  cvNormalize(weights, weights, 1, 0, CV_L1);
+  //get cumulative    sum
+  mcvCumSum(weights, weights);
+
+  //random number generator
+  CvRNG rng = cvRNG(0xffffffff);
+  //matrix to hold random sample
+  CvMat *randInd = cvCreateMat(numSamples, 1, CV_32SC1);
+  CvMat *samplePoints = cvCreateMat(2, numSamples, CV_32FC1);
+  //flag for points currently included in the set
+  CvMat *pointIn = cvCreateMat(1, points->cols, CV_8SC1);
+  //returned lines
+  float curLineRTheta[2], curLineAbc[3];
+  float bestLineRTheta[2] = {-1.f, 0.f}, bestLineAbc[3];
+  float bestScore = 0, bestDist = 1e5;
+  float dist, score;
+  Line curEndPointLine = {{-1., -1.}, {-1., -1.}},
+       bestEndPointLine = {{-1., -1.}, {-1., -1.}};
+  //variabels for getting endpoints
+  //int mini, maxi;
+  float minc = 1e5f, maxc = -1e5f, mind, maxd;
+  float x, y, c = 0.;
+  CvPoint2D32f minp(-1., -1.), maxp(-1., -1.);
+  //outer loop
+  for (int i = 0; i < numIterations; i++)
+  {
+    //set flag to zero
+    //cvSet(pointIn, cvRealScalar(0));
+    cvSetZero(pointIn);
+//get random sample from the points
+#warning "Using weighted sampling for Ransac Line"
+    // 	cvRandArr(&rng, randInd, CV_RAND_UNI, cvRealScalar(0), cvRealScalar(points->cols));
+    mcvSampleWeighted(weights, numSamples, randInd, &rng);
+
+    for (int j = 0; j < numSamples; j++)
+    {
+      //flag it as included
+      CV_MAT_ELEM(*pointIn, char, 0, CV_MAT_ELEM(*randInd, int, j, 0)) = 1;
+      //put point
+      CV_MAT_ELEM(*samplePoints, float, 0, j) =
+          CV_MAT_ELEM(*points, float, 0, CV_MAT_ELEM(*randInd, int, j, 0));
+      CV_MAT_ELEM(*samplePoints, float, 1, j) =
+          CV_MAT_ELEM(*points, float, 1, CV_MAT_ELEM(*randInd, int, j, 0));
+    }
+
+    //fit the line
+    mcvFitRobustLine(samplePoints, curLineRTheta, curLineAbc);
+
+    //get end points from points in the samplePoints
+    minc = 1e5;
+    mind = 1e5;
+    maxc = -1e5;
+    maxd = -1e5;
+    for (int j = 0; getEndPoints && j < numSamples; ++j)
+    {
+      //get x & y
+      x = CV_MAT_ELEM(*samplePoints, float, 0, j);
+      y = CV_MAT_ELEM(*samplePoints, float, 1, j);
+
+      //get the coordinate to work on
+      if (lineType == LINE_HORIZONTAL)
+        c = x;
+      else if (lineType == LINE_VERTICAL)
+        c = y;
+      //compare
+      if (c > maxc)
+      {
+        maxc = c;
+        maxp = cvPoint2D32f(x, y);
+      }
+      if (c < minc)
+      {
+        minc = c;
+        minp = cvPoint2D32f(x, y);
+      }
+    } //for
+
+    //loop on other points and compute distance to the line
+    score = 0;
+    for (int j = 0; j < points->cols; j++)
+    {
+      // 	    //if not already inside
+      // 	    if (!CV_MAT_ELEM(*pointIn, char, 0, j))
+      // 	    {
+      //compute distance to line
+      dist = fabs(CV_MAT_ELEM(*points, float, 0, j) * curLineAbc[0] +
+                  CV_MAT_ELEM(*points, float, 1, j) * curLineAbc[1] + curLineAbc[2]);
+      //check distance
+      if (dist <= threshold)
+      {
+        //add this point
+        CV_MAT_ELEM(*pointIn, char, 0, j) = 1;
+        //update score
+        if(state->ipmSplines.size()>0)
+          score += cvGetReal2D(image, (int)(CV_MAT_ELEM(*points, float, 1, j) - .5),
+                             (int)(CV_MAT_ELEM(*points, float, 0, j) - .5))+ fabs(state->ipmSplines[1].line.rtheta[1]-curLineRTheta[1]);
+        else
+        {
+          score += cvGetReal2D(image, (int)(CV_MAT_ELEM(*points, float, 1, j) - .5),
+                             (int)(CV_MAT_ELEM(*points, float, 0, j) - .5));
+        }
+        
+      }
+      // 	    }
+    }
+
+    //check the number of close points and whether to consider this a good fit
+    int numClose = cvCountNonZero(pointIn);
+    //cout << "numClose=" << numClose << "\n";
+    if (numClose >= numGoodFit)
+    {
+      //get the points included to fit this line
+      CvMat *fitPoints = cvCreateMat(2, numClose, CV_32FC1);
+      int k = 0;
+      //loop on points and copy points included
+      for (int j = 0; j < points->cols; j++)
+        if (CV_MAT_ELEM(*pointIn, char, 0, j))
+        {
+          CV_MAT_ELEM(*fitPoints, float, 0, k) =
+              CV_MAT_ELEM(*points, float, 0, j);
+          CV_MAT_ELEM(*fitPoints, float, 1, k) =
+              CV_MAT_ELEM(*points, float, 1, j);
+          k++;
+        }
+
+      //fit the line
+      mcvFitRobustLine(fitPoints, curLineRTheta, curLineAbc);
+
+      //compute distances to new line
+      dist = 0.;
+      for (int j = 0; j < fitPoints->cols; j++)
+      {
+        //compute distance to line
+        x = CV_MAT_ELEM(*fitPoints, float, 0, j);
+        y = CV_MAT_ELEM(*fitPoints, float, 1, j);
+        float d = fabs(x * curLineAbc[0] +
+                       y * curLineAbc[1] +
+                       curLineAbc[2]) *
+                  cvGetReal2D(image, (int)(y - .5), (int)(x - .5));
+        dist += d;
+
+
+      }
+
+      //now check if we are getting the end points
+      if (getEndPoints)
+      {
+
+        //get distances
+        mind = minp.x * curLineAbc[0] +
+               minp.y * curLineAbc[1] + curLineAbc[2];
+        maxd = maxp.x * curLineAbc[0] +
+               maxp.y * curLineAbc[1] + curLineAbc[2];
+
+        //we have the index of min and max points, and
+        //their distance, so just get them and compute
+        //the end points
+        curEndPointLine.startPoint.x = minp.x - mind * curLineAbc[0];
+        curEndPointLine.startPoint.y = minp.y - mind * curLineAbc[1];
+
+        curEndPointLine.endPoint.x = maxp.x - maxd * curLineAbc[0];
+        curEndPointLine.endPoint.y = maxp.y - maxd * curLineAbc[1];
+
+        // 		SHOW_MAT(fitPoints, "fitPoints");
+       //	SHOW_LINE(curEndPointLine, "line");
+       
+      }
+
+      //dist /= score;
+
+      //clear fitPoints
+      cvReleaseMat(&fitPoints);
+
+      //check if to keep the line as best
+      if (score >= scoreThreshold && score > bestScore) //dist<bestDist //(numClose > bestScore)
+      {
+        //update max
+        bestScore = score; //numClose;
+        bestDist = dist;
+        //copy
+        bestLineRTheta[0] = curLineRTheta[0];
+        bestLineRTheta[1] = curLineRTheta[1];
+        bestLineAbc[0] = curLineAbc[0];
+        bestLineAbc[1] = curLineAbc[1];
+        bestLineAbc[2] = curLineAbc[2];
+        bestEndPointLine = curEndPointLine;
+      }
+    } // if numClose
+
+    //debug
+    if (DEBUG_LINES)
+    { //#ifdef DEBUG_GET_STOP_LINES
+      char str[256];
+      //convert image to rgb
+      CvMat *im = cvCloneMat(image);
+      mcvScaleMat(image, im);
+      CvMat *imageClr = cvCreateMat(image->rows, image->cols, CV_32FC3);
+      cvCvtColor(im, imageClr, CV_GRAY2RGB);
+
+      Line line;
+      //draw current line if there
+      if (curLineRTheta[0] > 0)
+      {
+        mcvIntersectLineRThetaWithBB(curLineRTheta[0], curLineRTheta[1],
+                                     cvSize(image->cols, image->rows), &line);
+        mcvDrawLine(imageClr, line, CV_RGB(1, 0, 0), 1);
+        if (getEndPoints)
+          mcvDrawLine(imageClr, curEndPointLine, CV_RGB(0, 1, 0), 1);
+      }
+  
+      //draw best line
+      if (bestLineRTheta[0] > 0)
+      {
+        mcvIntersectLineRThetaWithBB(bestLineRTheta[0], bestLineRTheta[1],
+                                     cvSize(image->cols, image->rows), &line);
+        mcvDrawLine(imageClr, line, CV_RGB(0, 0, 1), 1);
+        if (getEndPoints)
+          mcvDrawLine(imageClr, bestEndPointLine, CV_RGB(1, 1, 0), 1);
+      }
+      sprintf(str, "scor=%.2f, best=%.2f", score, bestScore);
+      mcvDrawText(imageClr, str, cvPoint(30, 30), .25, CV_RGB(255, 255, 255));
+
+      SHOW_IMAGE(imageClr, "5.Fit Ransac Line", 10);
+
+      //clear
+      cvReleaseMat(&im);
+      cvReleaseMat(&imageClr);
+    } //#endif
+  }   // for i
+
+  //return
+  if (lineRTheta)
+  {
+    lineRTheta[0] = bestLineRTheta[0];
+    lineRTheta[1] = bestLineRTheta[1];
+    
+    
+  }
+  if (lineXY)
+  {
+    if (getEndPoints)
+      *lineXY = bestEndPointLine;
+    else
+      mcvIntersectLineRThetaWithBB(lineRTheta[0], lineRTheta[1],
+                                   cvSize(image->cols - 1, image->rows - 1),
+                                   lineXY);
+
+  }
+  if (lineScore)
+    *lineScore = bestScore;
+
+  //clear
+  cvReleaseMat(&points);
+  cvReleaseMat(&samplePoints);
+  cvReleaseMat(&randInd);
+  cvReleaseMat(&pointIn);
+}
 void mcvFitRansacLine(const CvMat *image, int numSamples, int numIterations,
                       float threshold, float scoreThreshold, int numGoodFit,
                       bool getEndPoints, LineType lineType,
@@ -3643,7 +3926,8 @@ void mcvFitRansacLine(const CvMat *image, int numSamples, int numIterations,
         curEndPointLine.endPoint.y = maxp.y - maxd * curLineAbc[1];
 
         // 		SHOW_MAT(fitPoints, "fitPoints");
-        //  		SHOW_LINE(curEndPointLine, "line");
+       //	SHOW_LINE(curEndPointLine, "line");
+       
       }
 
       //dist /= score;
@@ -3713,6 +3997,7 @@ void mcvFitRansacLine(const CvMat *image, int numSamples, int numIterations,
   {
     lineRTheta[0] = bestLineRTheta[0];
     lineRTheta[1] = bestLineRTheta[1];
+    
     
   }
   if (lineXY)
@@ -3988,6 +4273,7 @@ void mcvGroupSplines(vector<Spline> &splines, vector<float> &scores)
  * \param splines vector of splines
  * \param lineScores scores of input lines
  */
+
 void mcvGroupMeasurement(vector<Spline> &splines, vector<float> &scores,vector<Particle> &sample,vector<CvRect> &ipmBoxes)
 
 {
@@ -4020,12 +4306,14 @@ void mcvGroupMeasurement(vector<Spline> &splines, vector<float> &scores,vector<P
     vector<Spline>::iterator spi, spj;
     vector<float>::iterator si, sj;
     vector<Particle>::iterator pi, pj;
+
     for (spi = splines.begin(), si = scores.begin(),pi=sample.begin();
          spi != splines.end(); spi++, si++,pi++)
       for (spj = spi + 1, sj = si + 1,pj = pi + 1; spj != splines.end(); spj++, sj++,pi++)
         //if to merge them
         if (mcvCheckMergeSplines(*spi, *spj, .1, 5, .2, 10, 15))
         {
+              
           stop = false;
           //keep straighter one
           float ci, cj;
@@ -4039,6 +4327,7 @@ void mcvGroupMeasurement(vector<Spline> &splines, vector<float> &scores,vector<P
             *si = *sj;
             *pi = *pj;
           }
+ 
           //remove j
           splines.erase(spj);
           scores.erase(sj);
@@ -4046,6 +4335,7 @@ void mcvGroupMeasurement(vector<Spline> &splines, vector<float> &scores,vector<P
 
           //break
           break;
+
         }
 
   } //while
@@ -4171,7 +4461,107 @@ void PointWorld2ImIPM(CvPoint2D32f &point, CvPoint2D32f &new_point,
  
 
 }
+
+void  mcvGetLinesLabel(const CvMat *im, vector<Line> &lines,
+                       vector<float> &lineScores, LaneDetectorConf *lineConf,
+                       LineType lineType,LineState *state,IPMInfo *ipmInfo)
+{
+  //Center Point of vehicle frame 
+  CvPoint2D32f cp = cvPoint2D32f(0,0);
+  PointWorld2ImIPM(cp,cp, ipmInfo);
+
+  if(state->ipmSplines.size()==0)
+  {
+    for (int i=0; i< lines.size(); i++)
+    {
+      lines[i].label = (((lines[i].endPoint.x-cp.x)/45)>0? 
+                  (int)((lines[i].endPoint.x-cp.x)/45+1.0):(int)((lines[i].endPoint.x-cp.x)/45-1.0));
+    }
+  }
+  else if(state->ipmSplines.size()!=0)
+  {
+
+    for(int j=0;j< lines.size();j++)
+    {
+      lines[j].label=0;
+      for(int i=0;i <state->ipmSplines.size();i++)
+      {
+        //cout << "\nw:"<<state->ipmSplines[i].points[4].x ;
+        if(fabs(state->ipmSplines[i].line.endPoint.x/2 +state->ipmSplines[i].line.startPoint.x /2 -lines[j].endPoint.x/2-lines[j].startPoint.x/2)<10)
+          if(fabs(state->ipmSplines[i].line.rtheta[1]-lines[j].rtheta[1])<0.2)
+            lines[j].label = state->ipmSplines[i].label;
+        //cout << "\ngetLabel_spline"<<state->ipmSplines[i].line.rtheta[1];  
+        //cout << "\ngetLabel"<<fabs(state->ipmSplines[i].line.rtheta[1]-lines[j].rtheta[1]) ;
+      }
+         
+    }
+    
+  }
+    //draw splines
+  if (0)
+  { //#ifdef DEBUG_GET_STOP_LINES
+
+    //get string
+    char title[256]; //str[256],
+    switch (lineType)
+    {
+    case LINE_HORIZONTAL:
+      sprintf(title, "Lines H");
+      break;
+    case LINE_VERTICAL:
+      sprintf(title, "5. Lines V");
+      printf("5. RANSAC line fitting after group the bounding boxes");
+      break;
+    }
+    //convert image to rgb
+    CvMat *im2 = cvCloneMat(im);
+    mcvScaleMat(im2, im2);
+    CvMat *imClr = cvCreateMat(im->rows, im->cols, CV_32FC3);
+    cvCvtColor(im2, imClr, CV_GRAY2RGB);
+    CvMat *imClr2 = cvCloneMat(imClr);
+    cvReleaseMat(&im2);
+    for(int i=0;i <state->ipmSplines.size();i++)
+      mcvDrawLine(imClr, state->ipmSplines[i].line, CV_RGB(0, 1, 1), 2);
+    //draw spline
+    for (unsigned int j = 0; j < lines.size(); j++)
+    { 
+
+      char str[32]; 
+      mcvDrawPoints(imClr, cvPoint2D32f(cp.x,100), CV_RGB(1, 1, 0), 3);  
+      sprintf(str, "%d", lines[j].label);
+      mcvDrawText(imClr, str,cvPoint((int)(lines[j].endPoint.x),100), .5, CV_RGB(0, 0, 255)); 
+      //if (fabs(lines[j].rtheta[1]-pre_state_theta) >0.1)
+      mcvDrawLine(imClr, lines[j], CV_RGB(0, 1, 0), 1);
+
+      //.....Draw parallel line.........................
+      //Line l_temp;
+      //l_temp.startPoint.x = lines[j].startPoint.x+5;
+      //l_temp.startPoint.y = lines[j].startPoint.y;
+      //l_temp.endPoint.x = lines[j].endPoint.x+5;
+      //l_temp.endPoint.y = lines[j].endPoint.y;
+      //mcvDrawLine(imClr, l_temp, CV_RGB(0, 1, 1), 1);
+      //l_temp.startPoint.x = lines[j].startPoint.x-5;
+      //l_temp.startPoint.y = lines[j].startPoint.y;
+      //l_temp.endPoint.x = lines[j].endPoint.x-5;
+      //l_temp.endPoint.y = lines[j].endPoint.y;
+      //mcvDrawLine(imClr, l_temp, CV_RGB(0, 1, 1), 1);
+      //.................................................
+
+      //else 
+      //  mcvDrawLine(imClr, lines[j], CV_RGB(1, 0, 0), 1);  
+      SHOW_IMAGE(imClr, title, 1);
+    }
+
+
+    //clear
+    cvReleaseMat(&imClr);
+    cvReleaseMat(&imClr2);
+
+  } //#endif
+}
 /******* lane width 40****/
+/* 2/4*/
+/*
 void mcvGetLinesLabel(const CvMat *im, vector<Line> &lines,
                        vector<float> &lineScores, LaneDetectorConf *lineConf,
                        LineType lineType,LineState *state,IPMInfo *ipmInfo)
@@ -4192,20 +4582,7 @@ void mcvGetLinesLabel(const CvMat *im, vector<Line> &lines,
     if(lines[i].label<MinL)
       MinL = lines[i].label;
   }
-  //for (int i=MinL;i<MaxL;i++){}
-  if(state->ipmSplines.size()!=0)
-  {
-    for(int i=0;i> state->ipmSplines.size();i++)
-    {
-      for(int j=0;j< lines.size();j++)
-      {
-        if(lines[j].label == state->ipmSplines[i].label){
-          if(fabs(lines[j].rtheta[1]-state->ipmSplines[i].tangent)>0.1)
-            lines.erase(lines.begin()+j);
-        }
-      }
-    }
-  }
+
     //draw splines
   if (1)
   { //#ifdef DEBUG_GET_STOP_LINES
@@ -4252,6 +4629,7 @@ void mcvGetLinesLabel(const CvMat *im, vector<Line> &lines,
 
   } //#endif
 }
+*/
 /** This function performs a RANSAC validation step on the detected lines
  *
  * \param image the input image
@@ -4276,7 +4654,7 @@ void mcvGetRansacLines(const CvMat *im, vector<Line> &lines,
   //float groupThreshold = 15;
   mcvGroupLines(lines, lineScores, lineConf->groupThreshold,
                 cvSize(width, height));
-  
+
   //group bounding boxes of lines
   float overlapThreshold = lineConf->overlapThreshold; //0.5; //.8;
   vector<CvRect> boxes;
@@ -4284,7 +4662,7 @@ void mcvGetRansacLines(const CvMat *im, vector<Line> &lines,
                            boxes);
   boxes.insert(boxes.end(), state->ipmBoxes.begin(),
   state->ipmBoxes.end());
-  //cout << "\n^^^" << lines.size();
+
   mcvGroupBoundingBoxes(boxes, lineType, overlapThreshold);
   //     mcvGroupLinesBoundingBoxes(lines, lineType, overlapThreshold,
   // 			       cvSize(width, height), boxes);
@@ -4292,7 +4670,7 @@ void mcvGetRansacLines(const CvMat *im, vector<Line> &lines,
   //     //check if there're no lines, then check the whole image
   //     if (boxes.size()<1)
   // 	boxes.push_back(cvRect(0, 0, width-1, height-1));
-  //cout << "\n^^^" << boxes.size();
+  //cout << "\nbox^^^" << boxes.size();
   int window = lineConf->ransacLineWindow; //15;
   vector<Line> newLines;
   vector<float> newScores;
@@ -4308,7 +4686,7 @@ void mcvGetRansacLines(const CvMat *im, vector<Line> &lines,
     
   for (int i = 0; i < (int)boxes.size(); i++) //lines
   {
-    // 	fprintf(stderr, "i=%d\n", i);
+    
     //Line line = lines[i];
     CvRect mask, box;
     //get box
@@ -4350,14 +4728,24 @@ void mcvGetRansacLines(const CvMat *im, vector<Line> &lines,
     float lineRTheta[2] = {-1, 0};
     float lineScore;
     Line line;
-    mcvFitRansacLine(subimage, lineConf->ransacLineNumSamples,
+    /*mcvFitRansacLine(subimage, lineConf->ransacLineNumSamples, 
                      lineConf->ransacLineNumIterations,
                      lineConf->ransacLineThreshold,
                      lineConf->ransacLineScoreThreshold,
                      lineConf->ransacLineNumGoodFit,
                      lineConf->getEndPoints, lineType,
-                     &line, lineRTheta, &lineScore);
-  
+                     &line, lineRTheta, &lineScore);*/
+    // **change Sunny's function**//
+    mcvFitRansacLine_slope(subimage, lineConf->ransacLineNumSamples, 
+                     lineConf->ransacLineNumIterations,
+                     lineConf->ransacLineThreshold,
+                     lineConf->ransacLineScoreThreshold,
+                     lineConf->ransacLineNumGoodFit,
+                     lineConf->getEndPoints, lineType,
+                     &line, lineRTheta, &lineScore,state);
+    line.rtheta[0]=lineRTheta[0];
+    line.rtheta[1]=lineRTheta[1];
+    
 //store the line if found and make sure it's not
 //near horizontal or vertical (depending on type)
 
@@ -4375,8 +4763,8 @@ void mcvGetRansacLines(const CvMat *im, vector<Line> &lines,
 
       case LINE_VERTICAL:
         //make sure it's not horizontal
-        if (fabs(lineRTheta[1]) > 12 * CV_PI / 180|| fabs(lineRTheta[1]-pre_state_theta)>0.2)
-          put = false;
+        if (fabs(lineRTheta[1]) > 20 * CV_PI / 180)//|| fabs(lineRTheta[1]-pre_state_theta)>0.2)
+         put = false;  
         break;
       }
       if (put)
@@ -4511,7 +4899,7 @@ void mcvGetRansacLines(const CvMat *im, vector<Line> &lines,
  *  \param rt  r and theta of the line
  * \param val the value to put
  */
-void mcvSetMatTheta(CvMat *inMat, CvRect mask,float rt[2], double val)
+void mcvSetMatTheta(CvMat *inMat, CvRect mask,float rt[2], double val,int window,IPMInfo *ipmInfo)
 {
 
   //get x-end points of region to work on, and work on the whole image height
@@ -4519,29 +4907,33 @@ void mcvSetMatTheta(CvMat *inMat, CvRect mask,float rt[2], double val)
   int xstart = mask.x, xend = mask.x + mask.width - 1;
   //xend = (int)fmin(fmax(line.startPoint.x, line.endPoint.x), width-1);
   int ystart = mask.y, yend = mask.y + mask.height - 1;
-  int w = mask.width/2-5;
+  int w = mask.width/4;
   //set other two windows to zero
   CvMat maskMat;
   CvRect rect;
   //part to the left of required region
   rect = cvRect(0, 0, xstart - 1, inMat->height);
+
   if (rect.x < inMat->width && rect.y < inMat->height &&
       rect.x >= 0 && rect.y >= 0 && rect.width > 0 && rect.height > 0)
   {
+
     for (int h=0; h<inMat->height;h++){
       int x = int(-tan(rt[1])*h+rt[0]/cos(rt[1]));
-      rect = cvRect(0, h, x - 1-w, 1);
+      rect = cvRect(0, h, x-w , 1);
       cvGetSubRect(inMat, &maskMat, rect);
       cvSet(&maskMat, cvRealScalar(val));
-    }
+    }    
+
   }
+
   //part to the right of required region
   if (rect.x < inMat->width && rect.y < inMat->height &&
       rect.x >= 0 && rect.y >= 0 && rect.width > 0 && rect.height > 0)
   {
     for (int h=0; h<inMat->height;h++){
       int x = int(-tan(rt[1])*h+rt[0]/cos(rt[1]));
-      rect = cvRect(x +w, h, inMat->width - x - 1-w, 1);
+      rect = cvRect(x +w, h, inMat->width - x -w, 1);
       cvGetSubRect(inMat, &maskMat, rect);
       cvSet(&maskMat, cvRealScalar(val));
     }
@@ -5247,19 +5639,17 @@ void mcvGetRansacSplines(const CvMat *im, vector<Line> &lines,
   #warning "no line grouping in getRansacSplines"
   vector<Line> tlines = lines;
   vector<float> tlineScores = lineScores;
-  mcvGroupLines(tlines, tlineScores, lineConf->groupThreshold,
-                cvSize(width - 1, height - 1));
+  //mcvGroupLines(tlines, tlineScores, lineConf->groupThreshold,
+  //              cvSize(width - 1, height - 1));
   mcvGetLinesLabel(image, tlines, lineScores, lineConf, lineType,state,ipmInfo);
   //Sunny - leave two 
   //cout << "\n^^^" << tlines.size();
   mcvTwoLanes(tlines, lineScores, cvSize(width, height), lineConf->checkLaneWidthMean,state,ipmInfo);
   //cout << "\n^^^" << tlines.size(); 
-  
+  //SHOW_LINE(tlines[1],"detect");
   //put the liens into the prevSplines to  initialize it
-  for (unsigned int i=0; i<tlines.size(); ++i)
-   cout << "\n&&"<<tlines[i].label;
 
-cin.get();
+
   //group bounding boxes of lines
   float overlapThreshold = lineConf->overlapThreshold; //0.5; //.8;
   vector<CvRect> boxes;
@@ -5311,6 +5701,8 @@ cin.get();
       //get extent of window to search in
       //int xstart = (int)fmax(fmin(line.startPoint.x, line.endPoint.x)-window, 0);
       //int xend = (int)fmin(fmax(line.startPoint.x, line.endPoint.x)+window, width-1);
+      if(fabs(tlines[i].rtheta[1])>0.03)
+        window -=3;
       int xstart =
           (int)fmax(box.x - window, 0);
       int xend = (int)fmin(box.x + box.width + window, width - 1);
@@ -5319,13 +5711,12 @@ cin.get();
     }
     break;
     }
-    tlines.clear();
-    tlineScores.clear();
-    
+
+
     //get the subimage to work on
     CvMat *subimage = cvCloneMat(image);
     //clear all but the mask
-    mcvSetMatTheta(subimage, mask,tlines[i].rtheta, 0);
+    mcvSetMatTheta(subimage, mask,tlines[i].rtheta, 0,window,ipmInfo);
     /*mcvFitRansacLine(subimage, lineConf->ransacLineNumSamples,
                      lineConf->ransacLineNumIterations,
                      lineConf->ransacLineThreshold,
@@ -5369,10 +5760,12 @@ cin.get();
                         iterSplines, iterScores,&state->ipmSplines);
     spline.tangent = tlines[i].rtheta[1];
     spline.label = tlines[i].label;
+    spline.line = tlines[i];
     for (int j=0;j<iterSplines.size();j++)
     {
       iterSplines[j].tangent = tlines[i].rtheta[1];
       iterSplines[j].label = tlines[i].label;
+      iterSplines[j].line = tlines[i];
     }
 
     //store the line if found
@@ -5385,7 +5778,7 @@ cin.get();
     }
     
     //debug
-    if (1)
+    if (0)
     { //#ifdef DEBUG_GET_STOP_LINES
 
       //get string
@@ -5407,13 +5800,13 @@ cin.get();
       cvCvtColor(subimage, subimageClr, CV_GRAY2RGB);
 
       //draw rectangle
-      mcvDrawRectangle(subimageClr, mask, CV_RGB(255, 255, 255), 1);
+      //mcvDrawRectangle(subimageClr, mask, CV_RGB(0, 0, 255), 1);
       Line line_temp =tlines[i];
-      line_temp.startPoint.x= tlines[i].startPoint.x+window/2+box.width/2;
-      line_temp.endPoint.x= tlines[i].endPoint.x+window/2+box.width/2;
+      line_temp.startPoint.x= tlines[i].startPoint.x+mask.width/2;
+      line_temp.endPoint.x= tlines[i].endPoint.x+mask.width/2;
       mcvDrawLine(subimageClr, line_temp, CV_RGB(255, 255, 255), 1);
-      line_temp.startPoint.x= tlines[i].startPoint.x-window/2-box.width/2;
-      line_temp.endPoint.x= tlines[i].endPoint.x-window/2-box.width/2;
+      line_temp.startPoint.x= tlines[i].startPoint.x-+mask.width/2;
+      line_temp.endPoint.x= tlines[i].endPoint.x-+mask.width/2;
       mcvDrawLine(subimageClr, line_temp, CV_RGB(255, 255, 255), 1);
       mcvDrawLine(subimageClr, tlines[i], CV_RGB(0, 255, 255), 1);
       //put text
@@ -5424,7 +5817,7 @@ cin.get();
       //draw spline
       if (spline.degree > 0)
         mcvDrawSpline(subimageClr, spline, CV_RGB(1, 0, 0), 1);
-      SHOW_IMAGE(subimageClr, title, 10);
+      SHOW_IMAGE(subimageClr, title, 1);
       //cin.get();
       //clear
       cvReleaseMat(&subimageClr);
@@ -5920,7 +6313,31 @@ void mcvDrawSpline(CvMat *image, Spline spline, CvScalar color, int width)
   //release
   cvReleaseMat(&pixels);
 }
+void mcvDrawSpline_noControlPoints(CvMat *image, Spline spline, CvScalar color, int width)
+{
+  //get spline pixels
+  CvMat *pixels = mcvGetBezierSplinePixels(spline, .05,
+                                           cvSize(image->width, image->height),
+                                           false);
+  //if no pixels
+  if (!pixels)
+    return;
 
+  //draw pixels in image with that color
+  for (int i = 0; i < pixels->height - 1; i++)
+    // 	cvSet2D(image,
+    // 		(int)cvGetReal2D(pixels, i, 1),
+    // 		(int)cvGetReal2D(pixels, i, 0),
+    // 		color);
+    cvLine(image, cvPoint((int)cvGetReal2D(pixels, i, 0), (int)cvGetReal2D(pixels, i, 1)),
+           cvPoint((int)cvGetReal2D(pixels, i + 1, 0),
+                   (int)cvGetReal2D(pixels, i + 1, 1)),
+           color, width);
+
+
+  //release
+  cvReleaseMat(&pixels);
+}
 /** This function draws a rectangle onto the passed image
  *
  * \param image the input iamge
@@ -6572,6 +6989,7 @@ CvMat *mcvExtendPoints_lsTangent(const CvMat *im, const CvMat *inPoints,
         t =cvPoint2D32f(cos(1.57-spline.tangent),-sin(1.57-spline.tangent));
         line = mcvGetExtendedNormalLine(curPoint,t, linePixelsTangent,
                                     linePixelsNormal, nextPoint);
+
        /*Draw the box direction*/
        //cvLine(imageClr, cvPoint(curPoint.x+100*t.x, curPoint.y+100*t.y),
        //      cvPoint(curPoint.x-100*t.x, curPoint.y-100*t.y),
@@ -6730,14 +7148,17 @@ CvMat *mcvExtendPoints_lsTangent(const CvMat *im, const CvMat *inPoints,
       if (!mcvIsValidPeak(peak, tangent, curPoint, angleThreshold) ||
           !mcvIsValidPeak(peak, meanDir, curPoint, meanDirAngleThreshold))
       {
-        t =cvPoint2D32f(cos(1.57-spline.tangent),sin(1.57-spline.tangent));
+        t =cvPoint2D32f(cos(1.57-spline.tangent)/2,sin(1.57-spline.tangent));
         line = mcvGetExtendedNormalLine(curPoint,t, linePixelsTangent,
                                     linePixelsNormal, nextPoint);
-                                //    cout << "\n--------------------" << spline.tangent;
+        //    cout << "\n--------------------" << spline.tangent;
+        //cout << "\ndowndwon" <<!mcvIsValidPeak(peak, tangent, curPoint, angleThreshold);
+
         //put normal point
         peak = nextPoint;
         //increment deviation count
         deviationCount++;
+
       }
       else
         deviationCount = 0;
@@ -6785,8 +7206,11 @@ CvMat *mcvExtendPoints_lsTangent(const CvMat *im, const CvMat *inPoints,
       cvCircle(imageClr, cvPointFrom32f(peak), 1, CV_RGB(0, 1, 0), -1);
       //input points
       cvCircle(imageClr, cvPointFrom32f(nextPoint), 1, CV_RGB(1, 0, 0), -1);
+      cvLine(imageClr, cvPointFrom32f(spline.line.startPoint),
+             cvPointFrom32f(spline.line.endPoint),  CV_RGB(1, 1, 0));
       //show image
       SHOW_IMAGE(imageClr, str,10);
+              
     } //#endif
   }
 
@@ -8807,10 +9231,9 @@ void mcvCheckLaneWidth(vector<Line> &lines, vector<float> &scores,
  * \param lines vector of lines
  * \param scores vector of line scores
  */
-
 void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float wMu,LineState *state, IPMInfo *ipmInfo)
 {
-   cout << "\n DEGUG TWO Lane";
+   
   //check if we have only 1, then exit
   if (lines.size() < 2)
   {
@@ -8830,6 +9253,7 @@ void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float 
     else if(lines[i].label==-1)
       G2.push_back(i);
   }
+
   // get the position between the close lines assuming they are vertical
   vector<float> rs;
   for (int i = 0; i < numInLines; i++)
@@ -8840,13 +9264,14 @@ void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float 
   
   int  mini,minj;
   double score = 0., minScore = 5000.;
-  if(G1.size()>0&&G2.size()>0){
+  if(G1.size()>0 && G2.size()>0 && state->ipmSplines.size()>0){
     for ( ig = G1.begin(); ig != G1.end(); ig++)
     {
       for ( jg = G2.begin(); jg != G2.end(); jg++)
       {
         //get that score
-        score = 0.5*fabs((fabs(rs[*ig] -rs[*jg]) - wMu))+10*fabs(lines[*ig].rtheta[1]-lines[*jg].rtheta[1]);
+        score = 0.7*fabs((fabs(rs[*ig] -rs[*jg]) - wMu))+50*fabs(lines[*ig].rtheta[1]-lines[*jg].rtheta[1]);
+        //cout << "\nscore" << score;
       //check max
         if (score <= minScore && score > 0)
         {
@@ -8854,10 +9279,70 @@ void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float 
           minScore = score;
           mini = *ig;
           minj= *jg;//j;//i+1;
-;
+
+        }
+      }     
+    }
+    //cout << "\n"<<  state->ipmSplines[0].line.rtheta[0]- state->ipmSplines[1].line.rtheta[0]; 
+    if (minScore>10)
+    {
+      float avg_th = state->ipmSplines[0].line.rtheta[1]/2+state->ipmSplines[1].line.rtheta[1] /2;
+      //cout << "\t" << avg_th << "\t"<<fabs(lines[mini].rtheta[1]- avg_th)<<"\t"<<fabs(lines[minj].rtheta[1]- avg_th);
+      
+      if((fabs(lines[mini].rtheta[1]- avg_th ) > fabs(lines[minj].rtheta[1]-avg_th)) )
+      {        
+        lines[mini] = state->ipmSplines[0].line;
+        //cout << "rrrrrright";// << avg_th << "\t"<<fabs(lines[mini].rtheta[1]- avg_th)<<"\t"<<fabs(lines[minj].rtheta[1]- avg_th);//cos(1.57-avg_th)*ipmInfo->height;  
+      } 
+      else 
+      {
+        //cout << "leffffffffft";//<< avg_th << "\t"<<fabs(lines[mini].rtheta[1]- avg_th)<<"\t"<<fabs(lines[minj].rtheta[1]- avg_th);;
+        lines[minj] = state->ipmSplines[1].line;
+      }
+    }
+
+    //now return the max and check threshold
+    vector<Line> newLines;
+    vector<float> newScores;
+
+    //add both
+    newLines.push_back(lines[mini]);
+    newLines.push_back(lines[minj]);
+    newScores.push_back(scores[mini]);
+    newScores.push_back(scores[minj]);
+
+    lines = newLines;
+    scores = newScores;
+
+    //clear
+    newLines.clear();
+    newScores.clear();
+    thetas.clear();
+    rs.clear();
+    G1.clear();
+    G2.clear();
+  }
+  else if(G1.size()>0 && G2.size()>0){
+    for ( ig = G1.begin(); ig != G1.end(); ig++)
+    {
+      for ( jg = G2.begin(); jg != G2.end(); jg++)
+      {
+        //get that score
+        score = 0.5*fabs((fabs(rs[*ig] -rs[*jg]) - wMu))+50*fabs(lines[*ig].rtheta[1]-lines[*jg].rtheta[1]);
+        cout << "\nscore" << score;
+      //check max
+        if (score <= minScore && score > 0)
+        {
+          //cout << "\n"<< i << "\tand\t" << i+1 <<"," << fabs(lines[i].rtheta[1]-lines[i+1].rtheta[1]);
+          minScore = score;
+          mini = *ig;
+          minj= *jg;//j;//i+1;
+
         }
       } 
+      
     }
+
     //now return the max and check threshold
     vector<Line> newLines;
     vector<float> newScores;
@@ -8881,13 +9366,325 @@ void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float 
   }
   else if(G1.size()>0 && G2.size()==0&& state->ipmSplines.size()>0){
     Line  line_;
-    line_.startPoint.x= cp.x;
-    line_.startPoint.y= ipmInfo->height-1;
-    line_.endPoint.x= cp.x+ cos(state->ipmSplines[0].tangent)*ipmInfo->height;
-    line_.endPoint.y= cp.y- sin(state->ipmSplines[0].tangent)*ipmInfo->height;
-    line_.rtheta[1] = state->ipmSplines[0].tangent;
-    line_.score =state->ipmSplines[0].score;
-    line_.label = -1;
+    line_ = state->ipmSplines[0].line;
+    line_.startPoint.x -= wMu;
+    line_.endPoint.x -= wMu;
+    line_.rtheta[0] -=wMu;
+    //cout << "\nG2 no" ; 
+    for ( ig = G1.begin(); ig != G1.end(); ig++)
+    {
+
+        //get that score
+        score = 0.5*fabs((fabs(rs[*ig] -(line_.startPoint.x-line_.endPoint.x)/2) - wMu))+10*fabs(lines[*ig].rtheta[1]-line_.rtheta[1]);
+      //check max
+        if (score <= minScore && score > 0)
+        {
+          //cout << score;
+          //cout << "\n"<< i << "\tand\t" << i+1 <<"," << fabs(lines[i].rtheta[1]-lines[i+1].rtheta[1]);
+          minScore = score;
+          mini = *ig;
+
+        }
+       
+    }
+
+    vector<Line> newLines;
+    vector<float> newScores;
+
+    //add both
+
+    newLines.push_back(lines[mini]);
+    newScores.push_back(scores[mini]);
+    newLines.push_back(line_);
+    newScores.push_back(line_.score);
+    lines = newLines;
+    scores = newScores;
+    //clear
+    newLines.clear();
+    newScores.clear();
+    thetas.clear();
+    rs.clear();
+    G1.clear();
+    G2.clear();
+  }
+  else if(G2.size()>0 && G1.size()==0 && state->ipmSplines.size()>0){
+
+    Line  line_;
+    line_ = state->ipmSplines[1].line;
+    line_.startPoint.x += wMu;
+    line_.endPoint.x += wMu;
+    line_.rtheta[0] +=wMu;
+    //cout << "\nG1 no" ;
+    for ( ig = G2.begin(); ig != G2.end(); ig++)
+    {
+
+        //get that score
+        score = 0.5*fabs((fabs(rs[*ig] -(line_.startPoint.x-line_.endPoint.x)/2) - wMu))+10*fabs(lines[*ig].rtheta[1]-line_.rtheta[1]);
+      //check max
+        if (score <= minScore && score > 0)
+        {          
+          //cout << score;
+          minScore = score;
+          mini = *ig;
+        }
+       
+    }
+
+    //add both   
+    vector<Line> newLines;
+    vector<float> newScores;
+    newLines.push_back(line_);
+    newScores.push_back(scores[mini]);  
+    newLines.push_back(lines[mini]);
+    newScores.push_back(scores[mini]);
+
+    lines = newLines;
+    scores = newScores;
+   
+    //clear
+    newLines.clear();
+    newScores.clear();
+    thetas.clear();
+    rs.clear();
+    G1.clear();
+    G2.clear();
+  }
+  else if(G2.size()>0 && G1.size()==0 ){
+    
+    Line  line_;
+    line_.endPoint.x= cp.x + 45/2;
+    line_.endPoint.y= 239;
+
+
+    line_.startPoint.x=  cp.x + 45/2;//cos(1.57-state->ipmSplines[0].tangent)*ipmInfo->height;
+    line_.startPoint.y= 0;
+    line_.rtheta[1] = 0;
+    line_.rtheta[0] =cp.x + 45/2;
+    line_.score =0;
+    line_.label = 1;
+
+    for ( ig = G2.begin(); ig != G2.end(); ig++)
+    {
+
+        //get that score
+        score = 0.5*fabs((fabs(rs[*ig] -(line_.startPoint.x-line_.endPoint.x)/2) - wMu))+10*fabs(lines[*ig].rtheta[1]-line_.rtheta[1]);
+      //check max
+        if (score <= minScore && score > 0)
+        {          
+          minScore = score;
+          mini = *ig;
+        }
+       
+    }
+
+    //add both   
+    vector<Line> newLines;
+    vector<float> newScores;  
+    newLines.push_back(line_);
+    newScores.push_back(scores[mini]);
+    newLines.push_back(lines[mini]);
+    newScores.push_back(scores[mini]);
+
+    lines = newLines;
+    scores = newScores;
+   
+    //clear
+    newLines.clear();
+    newScores.clear();
+    thetas.clear();
+    rs.clear();
+    G1.clear();
+    G2.clear();
+  }
+  else if(G2.size()==0 && G1.size()==0 && state->ipmSplines.size()>0 ){
+    //cout << "\n DEGUG TWO Lane";
+    Line  line_;
+    vector<Line> newLines;
+    vector<float> newScores;
+
+    line_ = state->ipmSplines[0].line;
+
+    //add both   
+    newScores.push_back(line_.score);
+    newLines.push_back(line_);
+    line_ = state->ipmSplines[1].line;
+
+    //add both   
+    newScores.push_back(line_.score);
+    newLines.push_back(line_);
+
+
+
+    lines = newLines;
+    scores = newScores;
+   
+    //clear
+    newLines.clear();
+    newScores.clear();
+    thetas.clear();
+    rs.clear();
+    G1.clear();
+    G2.clear();
+  }
+  
+}  
+/****2/4****/
+/*
+void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float wMu,LineState *state, IPMInfo *ipmInfo)
+{
+   
+  //check if we have only 1, then exit
+  if (lines.size() < 2)
+  {
+    return;
+  }
+  int numInLines = lines.size();
+  CvPoint2D32f cp = cvPoint2D32f(0,0);
+  PointWorld2ImIPM(cp,cp, ipmInfo);
+  vector<float> thetas(state->ipmSplines.size());
+  vector<int> G1;
+  vector<int> G2;
+
+  for (int i = 0; i < numInLines; i++)
+  {
+    if(lines[i].label==1)
+      G1.push_back(i);
+    else if(lines[i].label==-1)
+      G2.push_back(i);
+  }
+
+  // get the position between the close lines assuming they are vertical
+  vector<float> rs;
+  for (int i = 0; i < numInLines; i++)
+    rs.push_back((lines[i].startPoint.x + lines[i].endPoint.x) / 2.);
+  
+  //now make a loop and check all possible pairs
+  vector<int>::iterator ig,jg;
+  
+  int  mini,minj;
+  double score = 0., minScore = 5000.;
+  if(G1.size()>0 && G2.size()>0 && state->ipmSplines.size()>0){
+    for ( ig = G1.begin(); ig != G1.end(); ig++)
+    {
+      for ( jg = G2.begin(); jg != G2.end(); jg++)
+      {
+        //get that score
+        score = 0.7*fabs((fabs(rs[*ig] -rs[*jg]) - wMu))+50*fabs(lines[*ig].rtheta[1]-lines[*jg].rtheta[1]);
+        cout << "\nscore" << score;
+      //check max
+        if (score <= minScore && score > 0)
+        {
+          //cout << "\n"<< i << "\tand\t" << i+1 <<"," << fabs(lines[i].rtheta[1]-lines[i+1].rtheta[1]);
+          minScore = score;
+          mini = *ig;
+          minj= *jg;//j;//i+1;
+
+        }
+      }     
+    }
+
+    if (minScore>20)
+    {
+      float avg_th = state->ipmSplines[0].tangent/2+state->ipmSplines[1].tangent/2 ;
+      if(lines[mini].rtheta[1]- avg_th > lines[minj].rtheta[1]-avg_th ){
+        
+        lines[mini].endPoint.x= cp.x + wMu;
+        lines[mini].endPoint.y= 239;
+        lines[mini].startPoint.x=  cp.x + wMu +cos(1.57-avg_th)*ipmInfo->height;
+        lines[mini].startPoint.y= 0;
+        lines[mini].rtheta[1] = avg_th;
+        lines[mini].rtheta[0] =  lines[mini].startPoint.x;
+        lines[mini].score =0;
+        lines[mini].label =1;
+        //cout << "rrrrrright" << avg_th << "\t"<<cos(1.57-avg_th)*ipmInfo->height;  
+      }
+      else{
+        //cout << "leffffffffft";
+        lines[minj].endPoint.x= cp.x - wMu;
+        lines[minj].endPoint.y= 239;
+        lines[minj].startPoint.x=  cp.x - wMu+cos(1.57-avg_th)*ipmInfo->height;
+        lines[minj].startPoint.y= 0;
+        lines[minj].rtheta[1] =avg_th;
+        lines[minj].rtheta[0] =  lines[minj].startPoint.x;
+        lines[minj].score =0;
+        lines[mini].label =1;
+      }
+    }
+
+    //now return the max and check threshold
+    vector<Line> newLines;
+    vector<float> newScores;
+
+    //add both
+    newLines.push_back(lines[mini]);
+    newLines.push_back(lines[minj]);
+    newScores.push_back(scores[mini]);
+    newScores.push_back(scores[minj]);
+
+    lines = newLines;
+    scores = newScores;
+
+    //clear
+    newLines.clear();
+    newScores.clear();
+    thetas.clear();
+    rs.clear();
+    G1.clear();
+    G2.clear();
+  }
+  else if(G1.size()>0 && G2.size()>0){
+    for ( ig = G1.begin(); ig != G1.end(); ig++)
+    {
+      for ( jg = G2.begin(); jg != G2.end(); jg++)
+      {
+        //get that score
+        score = 0.5*fabs((fabs(rs[*ig] -rs[*jg]) - wMu))+50*fabs(lines[*ig].rtheta[1]-lines[*jg].rtheta[1]);
+        cout << "\nscore" << score;
+      //check max
+        if (score <= minScore && score > 0)
+        {
+          //cout << "\n"<< i << "\tand\t" << i+1 <<"," << fabs(lines[i].rtheta[1]-lines[i+1].rtheta[1]);
+          minScore = score;
+          mini = *ig;
+          minj= *jg;//j;//i+1;
+
+        }
+      } 
+      
+    }
+
+    //now return the max and check threshold
+    vector<Line> newLines;
+    vector<float> newScores;
+
+    //add both
+    newLines.push_back(lines[mini]);
+    newLines.push_back(lines[minj]);
+    newScores.push_back(scores[mini]);
+    newScores.push_back(scores[minj]);
+
+    lines = newLines;
+    scores = newScores;
+
+    //clear
+    newLines.clear();
+    newScores.clear();
+    thetas.clear();
+    rs.clear();
+    G1.clear();
+    G2.clear();
+  }
+  else if(G1.size()>0 && G2.size()==0&& state->ipmSplines.size()>0){
+    Line  line_;
+    float avg_th = state->ipmSplines[0].tangent/2+state->ipmSplines[1].tangent/2 ;
+    line_.endPoint.x= cp.x - 45/2;
+    line_.endPoint.y= 239;
+    line_.startPoint.x= cp.x - wMu+cos(1.57-avg_th)*ipmInfo->height;
+    line_.startPoint.y= 0;
+    line_.rtheta[0] = avg_th;
+    line_.rtheta[1] = line_.startPoint.x;
+    line_.score =0;
+    line_.label = 1;
 
     for ( ig = G1.begin(); ig != G1.end(); ig++)
     {
@@ -8913,7 +9710,7 @@ void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float 
     newLines.push_back(lines[mini]);
     newScores.push_back(scores[mini]);
     newLines.push_back(line_);
-    newScores.push_back(scores[mini]);
+    newScores.push_back(line_.score);
     lines = newLines;
     scores = newScores;
     //clear
@@ -8925,46 +9722,40 @@ void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float 
     G2.clear();
   }
   else if(G2.size()>0 && G1.size()==0 && state->ipmSplines.size()>0){
+
     Line  line_;
+    float avg_th = state->ipmSplines[0].tangent/2+state->ipmSplines[1].tangent/2 ;
     line_.endPoint.x= cp.x + 45/2;
     line_.endPoint.y= 239;
-    line_.startPoint.x=  cp.x + 45/2+5;//cos(1.57-state->ipmSplines[0].tangent)*ipmInfo->height;
+    line_.startPoint.x= cp.x + wMu+cos(1.57-avg_th)*ipmInfo->height;
     line_.startPoint.y= 0;
-    line_.rtheta[1] = state->ipmSplines[0].tangent;
+    line_.rtheta[1] = avg_th;
+    line_.rtheta[0] = line_.endPoint.x;
     line_.score =state->ipmSplines[0].score;
     line_.label = 1;
 
     for ( ig = G2.begin(); ig != G2.end(); ig++)
     {
-      cout << "\n"<<line_.startPoint.x << "\t"<<line_.startPoint.y;
-      cout << "\n"<<line_.endPoint.x << "\t"<<line_.endPoint.y;
-      cin.get();
+
         //get that score
         score = 0.5*fabs((fabs(rs[*ig] -(line_.startPoint.x-line_.endPoint.x)/2) - wMu))+10*fabs(lines[*ig].rtheta[1]-line_.rtheta[1]);
       //check max
         if (score <= minScore && score > 0)
-        {
-          
+        {          
           minScore = score;
           mini = *ig;
-            //add both
-
         }
-        cout << *ig;
        
     }
+
+    //add both   
     vector<Line> newLines;
     vector<float> newScores;
-
-    //add both
-    cout << "\n"<<lines[mini].startPoint.x  << "\t"<<lines[mini].startPoint.y;
-    cout << "\n"<<lines[mini].endPoint.x << "\t"<<lines[mini].endPoint.y;
-    cin.get();
-    
+    newLines.push_back(line_);
+    newScores.push_back(scores[mini]);  
     newLines.push_back(lines[mini]);
     newScores.push_back(scores[mini]);
-    newLines.push_back(line_);
-    newScores.push_back(scores[mini]);
+
     lines = newLines;
     scores = newScores;
    
@@ -8976,8 +9767,99 @@ void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float 
     G1.clear();
     G2.clear();
   }
-}
+    else if(G2.size()>0 && G1.size()==0 ){
+    
+    Line  line_;
+    line_.endPoint.x= cp.x + 45/2;
+    line_.endPoint.y= 239;
 
+
+    line_.startPoint.x=  cp.x + 45/2;//cos(1.57-state->ipmSplines[0].tangent)*ipmInfo->height;
+    line_.startPoint.y= 0;
+    line_.rtheta[1] = 0;
+    line_.rtheta[0] =cp.x + 45/2;
+    line_.score =0;
+    line_.label = 1;
+
+    for ( ig = G2.begin(); ig != G2.end(); ig++)
+    {
+
+        //get that score
+        score = 0.5*fabs((fabs(rs[*ig] -(line_.startPoint.x-line_.endPoint.x)/2) - wMu))+10*fabs(lines[*ig].rtheta[1]-line_.rtheta[1]);
+      //check max
+        if (score <= minScore && score > 0)
+        {          
+          minScore = score;
+          mini = *ig;
+        }
+       
+    }
+
+    //add both   
+    vector<Line> newLines;
+    vector<float> newScores;  
+    newLines.push_back(line_);
+    newScores.push_back(scores[mini]);
+    newLines.push_back(lines[mini]);
+    newScores.push_back(scores[mini]);
+
+    lines = newLines;
+    scores = newScores;
+   
+    //clear
+    newLines.clear();
+    newScores.clear();
+    thetas.clear();
+    rs.clear();
+    G1.clear();
+    G2.clear();
+  }
+  else if(G2.size()==0 && G1.size()==0 ){
+    cout << "\n DEGUG TWO Lane";
+    Line  line_;
+    vector<Line> newLines;
+    vector<float> newScores;
+    line_.endPoint.x= cp.x + 45/2;
+    line_.endPoint.y= ipmInfo->height-1;
+    line_.startPoint.x=  cp.x + 45/2;//cos(1.57-state->ipmSplines[0].tangent)*ipmInfo->height;
+    line_.startPoint.y= 0;
+    line_.rtheta[1] = state->ipmSplines[0].tangent;
+    line_.rtheta[0] =cp.x + 45/2;
+    line_.score =state->ipmSplines[0].score;
+    line_.label = 1;
+
+    //add both   
+    newScores.push_back(line_.score);
+    newLines.push_back(line_);
+    line_.endPoint.x= cp.x - 45/2;
+    line_.endPoint.y= ipmInfo->height-1;
+    line_.startPoint.x=  cp.x - 45/2;//cos(1.57-state->ipmSplines[0].tangent)*ipmInfo->height;
+    line_.startPoint.y= 0;
+    line_.rtheta[1] = state->ipmSplines[1].tangent;
+    line_.rtheta[0] =cp.x - 45/2;
+    line_.score =state->ipmSplines[0].score;
+    line_.label = -1;
+
+    //add both   
+    newScores.push_back(line_.score);
+    newLines.push_back(line_);
+
+
+
+    lines = newLines;
+    scores = newScores;
+   
+    //clear
+    newLines.clear();
+    newScores.clear();
+    thetas.clear();
+    rs.clear();
+    G1.clear();
+    G2.clear();
+  }
+  
+}  
+*/
 /*1/16*/
 /*
 void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float wMu)

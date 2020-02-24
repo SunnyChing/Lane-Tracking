@@ -57,6 +57,8 @@ typedef struct Spline
   LineColor color;
   ///score of spline
   float score;
+  // Least square Line (Or the approximate line)
+  Line line;
   // line's tanget which define the box size, and the roughly direction of the spline
   float tangent;
   //label
@@ -105,7 +107,8 @@ typedef struct LineState_
   ///bounding boxes to work on the splines from the previous frames
   vector<CvRect> ipmBoxes;
  
-
+  vector<Spline> bestSplines;
+  
 } LineState;
 
 typedef struct LaneState_
@@ -811,7 +814,7 @@ void mcvGetLanes(const CvMat *inImage, const CvMat* clrImage,
  *
  */
 void mcvGetLines(const CvMat* image, LineType lineType, vector<Line> &lines,
-                 vector<float> &lineScores, vector<Spline> &splines,
+                 vector<float> &lineScores, vector<Spline> &splines,vector<Spline> &bestsplines,
                  vector<float> &splineScores, LaneDetectorConf *lineConf,
                  LineState *state, IPMInfo *ipmInfo);
 
@@ -875,7 +878,10 @@ void mcvFitRansacLine(const CvMat *image, int numSamples, int numIterations,
                       float threshold, float scoreThreshold, int numGoodFit,
                       bool getEndPoints, LineType lineType,
                       Line *lineXY, float *lineRTheta, float *lineScore);
-
+void mcvFitRansacLine_slope(const CvMat *image, int numSamples, int numIterations,
+                      float threshold, float scoreThreshold, int numGoodFit,
+                      bool getEndPoints, LineType lineType,
+                      Line *lineXY, float *lineRTheta, float *lineScore, LineState *state);
 /** This functions fits a line using the orthogonal distance to the line
     by minimizing the sum of squares of this distance.
 
@@ -935,7 +941,7 @@ void PointWorld2ImIPM(CvPoint2D32f &point, CvPoint2D32f &new_point, IPMInfo *ipm
  *  \param rt  r and theta of the line
  * \param val the value to put
  */
-void mcvSetMatTheta(CvMat *inMat, CvRect mask,float rt[2], double val);
+void mcvSetMatTheta(CvMat *inMat, CvRect mask,float rt[2], double val,int window, IPMInfo *ipmInfo);
 /** This function sets the matrix to a value except for the mask window passed
  * in
  *
@@ -977,7 +983,7 @@ void mcvLinesImIPM2Im(vector<Line> &lines, IPMInfo &ipmInfo,
  *
  */
 void mcvDrawSpline(CvMat *image, Spline spline, CvScalar color, int width);
-
+void mcvDrawSpline_noControlPoints(CvMat *image, Spline spline, CvScalar color, int width);
 
 /** This functions implements RANSAC algorithm for spline fitting
     given an image

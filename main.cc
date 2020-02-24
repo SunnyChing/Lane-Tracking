@@ -216,7 +216,7 @@ void ProcessImage(float motionV,float motionW,bool *isInit, const char* filename
       // set the wait value
       int wait = options.step_flag ? 0 : options.wait_arg;
       // show image with detected lanes
-      SHOW_IMAGE(imDisplay, "Detected Lanes", wait);
+      //SHOW_IMAGE(imDisplay, "Detected Lanes", wait);
     }
     // save?
     if (options.save_images_flag)

@@ -92,7 +92,8 @@ namespace LaneDetector
      * \param current state: x(k)
      * \param measurement: bar_x(k+1)
      */
-    LaneState* update(LaneState* state,LaneState* measurement,float num);
+    LaneState* update(LaneState* state,LaneState* measurement,float num, const IPMInfo *ipmInfo);
+    void PredictSlope(const CvMat *cpoints, Line* line, const IPMInfo *ipmInfo);
      /*
      * This function is the resampling step of the particle filter .
      * \param current state: x(k)

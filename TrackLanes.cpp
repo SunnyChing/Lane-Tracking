@@ -57,7 +57,8 @@ void CalculateSample(const CvMat *im, LaneDetectorConf *lineConf, LaneState *sam
   samples->Splines.clear();
   samples->ipmBoxes = state->ipmBoxes;
   samples->ipmSplines = state->ipmSplines;
-
+  //if(state->ipmSplines.size())
+  //cout << "\nDebug" <<state->ipmSplines[0].tangent;
   for (int i = 0; i < (int)state->ipmSplines.size(); i++)
   {
 
@@ -108,7 +109,7 @@ void CalculateSample(const CvMat *im, LaneDetectorConf *lineConf, LaneState *sam
     }
     
     samples->samples.push_back(p);
-    //cout << "\nlabel:" << state->ipmSplines[i].label;
+    //cout << "\nlabel:" << state->ipmSplines[i].line.startPoint.x;
     //cout << "\n measurment" << p.points[0].x << "\t"<<p.points[1].x << "\t"<<p.points[2].x << "\t"<<p.points[3].x ;
   }
 }
@@ -186,15 +187,19 @@ void InitPF(LaneState *measurements, LaneState *state, float num)
   cv::RNG rng;
   CvParticle2D32f ps_;
   vector<float> scores;
-
+  //cout << measurements->ipmSplines.size();
+    for (int i = 0; i < (int)measurements->ipmSplines.size(); i++)
+    SHOW_SPLINE (measurements->ipmSplines[i]);
   for (int i = 0; i < (int)measurements->ipmSplines.size(); i++)
-  scores.push_back(measurements->ipmSplines[i].score);
+    scores.push_back(measurements->ipmSplines[i].score);
+
   mcvGroupMeasurement(measurements->ipmSplines,scores,measurements->samples,measurements->ipmBoxes);
+  
   state->ipmBoxes.clear();
   state->ipmSplines.clear();
   state->samples.clear();
   state->Splines.clear();
-  state->ipmBoxes = measurements->ipmBoxes;
+  //state->ipmBoxes = measurements->ipmBoxes;
   state->ipmSplines = measurements->ipmSplines;
   state->samples = measurements->samples;
 
@@ -258,12 +263,12 @@ void laneEvalModel(Particle* sample,float motionV,float motionW, LaneDetectorCon
     
     for(int i=0;i<state_size;i++)
     {
-      float n = rng.gaussian(4);
+      float n = rng.gaussian(3);
       float v =rng.gaussian(0.004);
       float x_k =  sample->ps[k].p[i].x;
       float y_k = lineConf->ipmHeight- sample->ps[k].p[i].y;
       sample->ps[k].p[i].x =x_k*cos(motionW)- y_k*sin(motionW)+
-                            (motionV)*cos(motionW/2);
+                            (motionV)*sin(motionW/2);
 
       sample->ps[k].p[i].y =lineConf->ipmHeight-(x_k*sin(motionW)+ y_k*cos(motionW)-
                             (motionV)*cos(motionW/2));
@@ -641,7 +646,7 @@ CvMat *CvParticle2D32f2Mat(const CvParticle2D32f vec)
 }
 double SIGMA4 = 5;
 
-LaneState *update(LaneState *state, LaneState *measurement, float num)
+LaneState *update(LaneState *state, LaneState *measurement, float num, const IPMInfo *ipmInfo)
 {
   // update weight
   vector<CvParticle2D32f> update_ps;
@@ -739,14 +744,90 @@ LaneState *update(LaneState *state, LaneState *measurement, float num)
     CvMat *m = CvPoint2D32f2Mat(state->samples[i].points);
     //SHOW_MAT(m);
     Spline newSpline = mcvFitBezierSpline(m, 3);
+    PredictSlope(m,&(newSpline.line),ipmInfo);
+    //cout << "PredictSlope"<<newSpline.line.rtheta[1];
     newSpline.label = state->ipmSplines[i].label;
+    newSpline.tangent = state->ipmSplines[i].tangent;
     newSpline.noUpdate = state->ipmSplines[i].noUpdate;
     newSplines.push_back(newSpline);
+    //SHOW_LINE((newSpline.line), "line");      
   }
   state->ipmSplines.clear();
   state->ipmSplines = newSplines;
 
   return state;
+}
+void PredictSlope(const CvMat *cpoints, Line *line, const IPMInfo *ipmInfo )
+{
+  CvMat *W = cvCreateMat(2, 1, CV_32FC1);
+  CvMat *V = cvCreateMat(2, 2, CV_32FC1);
+  float meanX = 0, meanY = 0;
+  CvScalar mean;
+  CvMat row1, row2;
+
+  CvMat *cpointst = cvCreateMat(cpoints->rows,cpoints->cols, CV_32FC1);
+  cvCopy(cpoints, cpointst);
+  cvGetCol(cpointst, &row1, 0);
+  mean = cvAvg(&row1);
+  meanX = (float)mean.val[0];
+  cvSubS(&row1, mean, &row1);
+  //same for second row
+  cvGetCol(cpointst, &row2, 1);
+  mean = cvAvg(&row2);
+  meanY = (float)mean.val[0];
+  cvSubS(&row2, mean, &row2);
+  cvSVD(cpointst, W, 0, V, CV_SVD_V_T);
+
+    //get the [a,b] which is the second column corresponding to
+  //smaller singular value
+  float a, b, c;
+  a = CV_MAT_ELEM(*V, float, 0, 1);
+  b = CV_MAT_ELEM(*V, float, 1, 1);
+
+  //c = -meanX*a-meanY*b
+  c = -(meanX * a + meanY * b);
+  // cout << a <<"\t" << b << "\t"<<c;
+  //compute r and theta
+  //theta = atan(b/a)
+  //r = meanX cos(theta) + meanY sin(theta)
+  float r, theta;
+  theta = -atan2(b, a);
+  r = meanX * cos(theta) + meanY * sin(theta);
+    //correct
+  if (r < 0)
+  {
+    //correct r
+    r = -r;
+    //correct theta
+    theta += CV_PI;
+    if (theta > CV_PI)
+      theta -= 2 * CV_PI;
+
+  }
+
+  //else{
+  //  theta=-theta;
+  //}
+
+  cvReleaseMat(&cpointst);
+  cvReleaseMat(&W);
+  cvReleaseMat(&V);
+
+  //we have the index of min and max points, and
+  //their distance, so just get them and compute
+  //the end points
+
+  line->startPoint.x = -c/a-b/a*(ipmInfo->height-1);
+  line->startPoint.y =0;
+
+  line->endPoint.x = -c/a;
+  line->endPoint.y = ipmInfo->height-1;
+  //theta = atan2(line->endPoint.y-line->startPoint.y,line->endPoint.x -line->startPoint.x);
+  //theta -= CV_PI/2;
+  //SHOW_LINE(*line, "line");
+  line->rtheta[0]=r;
+  line->rtheta[1]=theta;
+
 }
 /// 
 /*
@@ -1065,6 +1146,7 @@ void resample(LaneState *state, float num, float Nth){
     update_weight.clear();
   }
 }
+
 void updateCenterlineWid(LaneState *state,CenterLineState *center_line,CameraInfo *cameraInfo){
       
   if (state->samples.size()<2)
@@ -1146,32 +1228,33 @@ void TrackLanes_PF(float motionV,float motionW,CvMat *dbipm, LaneState *measurem
                   IPMInfo *ipmInfo,LaneDetectorConf *LineConf,CameraInfo *cameraInfo, 
                   LaneState *pre_state, LineState *state, bool *isInit,CenterLineState *center_line)
 {
-
-  // get measurement
-  float np = 2000;
+ 
+  // get meas5urement
+  float np = 1500;
 
   printf("Start Track, calculate measurement");
   CalculateSample(dbipm, LineConf, measurements, state);
   printf("n control point \n");
-
+  
   LaneState lane_state_next;
   LaneState *new_state;
-
+  //for(int i=0;i<state_size;i++){
+  // cout << "\n++" << measurements->samples[0].points[i].x << "\t" <<  measurements->samples[0].points[i].y << "\n";
+  //}
   // initial lane state
   if (*isInit == false)
   {
-      if (state->ipmSplines.size()==0)
-      return;
-    InitPF(measurements, pre_state, np);   
-    InitCenterline(pre_state,center_line,cameraInfo);
-    printf("Inital PF \n");
-    *isInit = true;
 
-    
-     return;
+  InitPF(measurements, pre_state, np);   
+  InitCenterline(pre_state,center_line,cameraInfo);
+  printf("Inital PF \n");
+  *isInit = true;
+  cin.get();
+  return;
   }
-  //or(int i=0;i<state_size;i++){
-   //cout << "\n++" << measurements->samples[0].points[i].x << "\t" <<  measurements->samples[0].points[i].y << "\n";
+
+  //for(int i=0;i<state_size;i++){
+  // cout << "\n++" << measurements->samples[0].points[i].x << "\t" <<  measurements->samples[0].points[i].y << "\n";
   //}
   //Prediction
   printf("Prediction \n");
@@ -1184,47 +1267,47 @@ void TrackLanes_PF(float motionV,float motionW,CvMat *dbipm, LaneState *measurem
   db= cvCreateMat(dbClr->rows, dbClr->cols,CV_32FC3);
   cvCopy(dbipm, dbClr);
   cvCvtColor(dbClr, db, CV_GRAY2RGB);
-  for (int i = 0; i < (int)lane_state_next.samples.size(); i++)
+  for (int i = 0; i < (int)lane_state_next.samples.size()-1; i++)
   {
-
     for (int k = 0; k < pre_state->samples[0].ps.size(); k++)
     {
       mcvDrawPoints(db, pre_state->samples[i].ps[k].p, CV_RGB(0, 0, 0), 0.5);
     }
   }
-  SHOW_IMAGE(db, "sample",10);
+    
+  //SHOW_IMAGE(db, "sample",10);
+
   //Update
-  new_state = update(&lane_state_next, measurements, np);
+  printf("Update\n");
+  new_state = update(&lane_state_next, measurements, np,ipmInfo);
   *pre_state = *new_state;
 
-  for(int i=0;i<state_size;i++){
-   //cout << "\n**" << pre_state->samples[0].points[i].x << "\t" <<  pre_state->samples[0].points[i].y << "\n";
-  }
-  printf("Update\n");
+  //for(int i=0;i<state_size;i++){
+  // cout << "\n**" << pre_state->samples[0].points[i].x << "\t" <<  pre_state->samples[0].points[i].y << "\n";
+  //}
+
   resample(pre_state, np, np /10);
   printf("\nResampling\n");
   Compute_curve(pre_state);
-  //if(DEBUG_LINES) {//    #ifdef DEBUG_GET_STOP_LINES
-  //CvMat *db;
-  //db = cvCreateMat(dbipm->height, dbipm->width, dbipm->type);
-  // cvCopy(dbipm, db);
+
   for (int i = 0; i < (int)measurements->samples.size(); i++)
   {
-    mcvDrawPoints(db,  measurements->samples[i].points, CV_RGB(1,1,0), 3);
-    //mcvDrawSpline(db, measurements->ipmSplines[i], CV_RGB(1,1,0), 1);
+    mcvDrawPoints(db,  measurements->samples[i].points, CV_RGB(0,1,1), 3);
+    mcvDrawSpline_noControlPoints(db, measurements->ipmSplines[i], CV_RGB(0,1,1), 1);
   }
   
   for (int i = 0; i < (int)lane_state_next.samples.size(); i++)
   {
     //mcvDrawPoints(db,  measurements->samples[i].points, CV_RGB(1,1,1), 3);
-    mcvDrawSpline(db, pre_state->ipmSplines[i], CV_RGB(0,1,1), 1);
-    mcvDrawPoints(db, pre_state->samples[i].points, CV_RGB(0, 1, 1), 2);
+    mcvDrawSpline_noControlPoints(db, pre_state->ipmSplines[i], CV_RGB(1,0,0), 2);
+    mcvDrawPoints(db, pre_state->samples[i].points, CV_RGB(1,0, 0), 3);
+    //mcvDrawLine(db, pre_state->ipmSplines[i].line, CV_RGB(0, 1, 0), 1);
    
   }
 
 
   
-  SHOW_IMAGE(db, "sample", 50);
+  SHOW_IMAGE(db, "sample", 1);
   cvReleaseMat(&db);
   cvReleaseMat(&dbClr);
   //}//#endif
@@ -1236,6 +1319,7 @@ void TrackLanes_PF(float motionV,float motionW,CvMat *dbipm, LaneState *measurem
   //cout << state->ipmSplines.size()<<"qqqqqqqqqqqqqqq\n";
   state->ipmBoxes = pre_state->ipmBoxes;
 
+  /*Update Camera Info*/
   printf("Update camera INFO\n");
   updateCenterlineWid(pre_state,center_line,cameraInfo);
   updateCenterlineHeight(center_line);
@@ -1243,14 +1327,12 @@ void TrackLanes_PF(float motionV,float motionW,CvMat *dbipm, LaneState *measurem
   //mcvUpdateCameraInfo (cameraInfo, center_line->pitch, center_line->hc[0]);
   cout << "\n~~~" << cameraInfo->pitch* 180/CV_PI;
 
-//CvMat *uvlane = CvPoint2D32f2Mat_inv(pre_state->samples[1].points);
-//SHOW_MAT(uvlane, "uv");
   for (int i = 0; i < (int)pre_state->samples.size(); i++){
-  for( int j=0; j<state_size;j++){
+    for( int j=0; j<state_size;j++)
+    {
     PointImIPM2World(pre_state->samples[i].points[j],pre_state->samples[i].points_w[j], ipmInfo);
     //cout << pre_state->samples[i].points_w[j].x<< "\n";
-  }
-  
+    }  
   }
 }
 
