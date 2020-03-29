@@ -31,6 +31,16 @@ namespace LaneDetector
      * \param 
      */
     void CalculateSample( const CvMat *im, LaneDetectorConf *lineConf,LaneState* samples,LineState* state);
+    /** for first image
+     * This function calculate the four control pints of the spline,
+     * {y_0,y_1,y_2,_3}
+     *
+     * \param 
+     *     
+     * \param 
+     * \param 
+     */
+    void CalculateSample_init( const CvMat *im, LaneDetectorConf *lineConf,LaneState* samples,LineState* state);
     /** This function draws point onto the passed image
      *
      * \param particle 
@@ -63,10 +73,11 @@ namespace LaneDetector
     /**
      * This function initialize the particle filter with related params.
      * \param first measurement
-     * \param current state: x(k)
+     * \param pre_state pre_state in PF
+     * \param state  measurment state
      * \param number of particle
      */
-    void InitPF(LaneState* measurements,LaneState* state,float num);
+    void InitPF(LaneState* measurements,LaneState* pre_state,float num);
         /**
      * This function reset the particle filter with related params, while the particle has not update for several time.
      * \param first measurement

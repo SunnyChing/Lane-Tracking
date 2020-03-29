@@ -23,7 +23,7 @@ for clip in $clips; do
 
   # command
   command="$binary $options --list-file=$path/$clip/list.txt  \
-    --list-path=$path/$clip/ --output-suffix=_results  --show-lane-numbers --step "
+    --list-path=$path/$clip/ --output-suffix=_results  --show-lane-numbers --step --debug"
   #command="$binary $options --image-file=$path/$clip/f00059_.png  \
   # --list-path=$path/$clip/  --output-suffix=_results --step --show-lane-numbers --debug"
     

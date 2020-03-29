@@ -1785,10 +1785,10 @@ void mcvGetLanes(const CvMat *inImage, const CvMat *clrImage,
       //mcvDrawText(dbIpmImage, str,
       //            cvPointFrom32f(dbIpmSplines[i].points[dbIpmSplines[i].degree]),
       //            .5, CV_RGB(0, 0, 255));
-      mcvDrawSpline(dbIpmImage, dbIpmSplines[i], CV_RGB(0, 255,0), 1);
+      //mcvDrawSpline(dbIpmImage, dbIpmSplines[i], CV_RGB(0, 255,0), 1);
       //cin.get();
     }
-  //SHOW_IMAGE(dbIpmImage, "Lanes IPM with lines", 1);
+  SHOW_IMAGE(dbIpmImage, "Lanes IPM with lines", 1);
   //cin.get();
   if(0)
   {
@@ -2268,7 +2268,7 @@ void mcvGetLines(const CvMat *image, LineType lineType,
                       lineConf->checkLaneWidthStd); //70&20 65&10 25&10
 
   vector<float> bestSplineScores;
-  vector<Spline> bestSplines;
+
   //check if to do RANSAC
   if (lineConf->ransac)
   {
@@ -2279,7 +2279,7 @@ void mcvGetLines(const CvMat *image, LineType lineType,
     //do RANSAC splines?
     if (lineConf->ransacSpline) // get splines, merge splines
       mcvGetRansacSplines(image, lines, lineScores,
-                          lineConf, lineType, splines, splineScores, bestSplines,bestSplineScores,state,ipmInfo);
+                          lineConf, lineType, splines, splineScores, bestsplines,bestSplineScores,state,ipmInfo);
   }
 
   //get bounding boxes around returned splines to pass to the next
@@ -4458,7 +4458,6 @@ void PointWorld2ImIPM(CvPoint2D32f &point, CvPoint2D32f &new_point,
   
   //y-direction
   new_point.y = point.y*ipmInfo->yScale*-1+ipmInfo->yLimits[1]*ipmInfo->yScale;
- 
 
 }
 
@@ -4498,7 +4497,7 @@ void  mcvGetLinesLabel(const CvMat *im, vector<Line> &lines,
     
   }
     //draw splines
-  if (0)
+  if (1)
   { //#ifdef DEBUG_GET_STOP_LINES
 
     //get string
@@ -5843,6 +5842,7 @@ void mcvGetRansacSplines(const CvMat *im, vector<Line> &lines,
   }*/
   //Sunny
   splines = newSplines;
+
   //splines = bestSplines;
   splineScores = newSplineScores;
   //splineScores = bestSplineScores;
@@ -6991,11 +6991,12 @@ CvMat *mcvExtendPoints_lsTangent(const CvMat *im, const CvMat *inPoints,
                                     linePixelsNormal, nextPoint);
 
        /*Draw the box direction*/
-       //cvLine(imageClr, cvPoint(curPoint.x+100*t.x, curPoint.y+100*t.y),
-       //      cvPoint(curPoint.x-100*t.x, curPoint.y-100*t.y),
+      // cvLine(imageClr, cvPoint(curPoint.x+100*t.x, curPoint.y+100*t.y),
+     //        cvPoint(curPoint.x-100*t.x, curPoint.y-100*t.y),
        //     CV_RGB(0, 0, 0));
         peak = nextPoint;
         deviationCount++;
+      
       }
       else
         deviationCount = 0;
@@ -7051,6 +7052,7 @@ CvMat *mcvExtendPoints_lsTangent(const CvMat *im, const CvMat *inPoints,
       cvCircle(imageClr, cvPointFrom32f(nextPoint), 1, CV_RGB(1, 0, 0), -1);
       //show image
       SHOW_IMAGE(imageClr, str,10);
+      //cin.get();
     } //#endif
 
   }   // while cont
@@ -9284,7 +9286,7 @@ void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float 
       }     
     }
     //cout << "\n"<<  state->ipmSplines[0].line.rtheta[0]- state->ipmSplines[1].line.rtheta[0]; 
-    if (minScore>10)
+    if (minScore>6)
     {
       float avg_th = state->ipmSplines[0].line.rtheta[1]/2+state->ipmSplines[1].line.rtheta[1] /2;
       //cout << "\t" << avg_th << "\t"<<fabs(lines[mini].rtheta[1]- avg_th)<<"\t"<<fabs(lines[minj].rtheta[1]- avg_th);
@@ -9329,7 +9331,7 @@ void mcvTwoLanes(vector<Line> &lines, vector<float> &scores, CvSize size, float 
       {
         //get that score
         score = 0.5*fabs((fabs(rs[*ig] -rs[*jg]) - wMu))+50*fabs(lines[*ig].rtheta[1]-lines[*jg].rtheta[1]);
-        cout << "\nscore" << score;
+        //cout << "\nscore" << score;
       //check max
         if (score <= minScore && score > 0)
         {

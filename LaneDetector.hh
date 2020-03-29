@@ -10,7 +10,7 @@
 
 #include "mcv.hh"
 #include "InversePerspectiveMapping.hh"
-
+#include <opencv2/imgproc.hpp>
 namespace LaneDetector
 {
 

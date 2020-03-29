@@ -8,6 +8,7 @@
 path="../clips"
 
 clips=" image_02_28"
+
 #get options
 options=" --show --save-lanes --wait=50 --lanes-conf=Lanes_kitti.conf \
       --camera-conf=CameraInfo_kitti.conf "

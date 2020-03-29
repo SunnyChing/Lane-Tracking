@@ -340,11 +340,8 @@ void mcvTransformGround2Image(const CvMat *inPoints,
  * the point of intersection of the image plane with the line
  * in the XY-plane in the world coordinates that makes an
  * angle yaw clockwise (form Y-axis) with Y-axis
- *
  * \param cameraInfo the input camera parameter
- *
  * \return the computed vanishing point in image frame
- *
  */
 FLOAT_POINT2D mcvGetVanishingPoint(const CameraInfo *cameraInfo)
 {

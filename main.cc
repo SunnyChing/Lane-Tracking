@@ -100,7 +100,7 @@ void ProcessImage(float motionV,float motionW,bool *isInit, const char* filename
                   gengetopt_args_info& options, ofstream* outputFile,ofstream* outputFile1,ofstream* outputFile2,
                   int index, clock_t *elapsedTime, LineState* line_state,LaneState* measurement, LaneState* prestate,CenterLineState *center_line)
 {
-  bool SAVE_IMAGE_IPM =false;
+  bool SAVE_IMAGE_IPM =true;
   // load the image
   CvMat *raw_mat, *mat, *dbipm;
   mcvLoadImage(filename, &raw_mat, &mat);
@@ -111,10 +111,10 @@ void ProcessImage(float motionV,float motionW,bool *isInit, const char* filename
   vector<Line> lines;
   vector<Spline> splines;
   dbipm = cvCreateMat((int)lanesConf.ipmHeight, (int)lanesConf.ipmWidth, mat->type);
- 
+
   clock_t startTime = clock();
   mcvGetLanes(mat, raw_mat, &lines, &lineScores, &splines, &splineScores,
-             &ipmInfo, &cameraInfo, &lanesConf,dbipm,line_state);  
+            &ipmInfo, &cameraInfo, &lanesConf,dbipm,line_state);  
 
     #warning "Sunny LaneTracking here"
   //printf("%s\n", *is+ Init ? "true" : "false");
@@ -124,11 +124,16 @@ void ProcessImage(float motionV,float motionW,bool *isInit, const char* filename
   if(SAVE_IMAGE_IPM){
     string f = string(filename);
     std::size_t botDirPos = f.find_last_of("/");
-    string file = "../IPM_image0228/IPM_" + f.substr(botDirPos+1, f.length()-4);
-    Mat b =Mat(dbipm, true);
-    b.convertTo(b, CV_32FC3, 255.0); 
-    imwrite(file,b);
+    string file = "../IPM_image0201-1/IPM_" + f.substr(botDirPos+1, f.length()-4);
+    Mat b =Mat(dbipm->rows,dbipm->cols ,dbipm->type ,dbipm);
+    b.convertTo(b, CV_64F, 255.0); 
+
+    SHOW_IMAGE(dbipm,"~~~",1);
+    cin.get();
+   imwrite(file,b);
+
   }*/
+  
   // cout <<measurement->samples[0].points[0].x<< "\n";
   cvReleaseMat(&dbipm);
 
@@ -216,7 +221,7 @@ void ProcessImage(float motionV,float motionW,bool *isInit, const char* filename
       // set the wait value
       int wait = options.step_flag ? 0 : options.wait_arg;
       // show image with detected lanes
-      //SHOW_IMAGE(imDisplay, "Detected Lanes", wait);
+      SHOW_IMAGE(imDisplay, "Detected Lanes", wait);
     }
     // save?
     if (options.save_images_flag)
